@@ -3,7 +3,7 @@
 A modern, feature-rich graphical application for wireless file transfer between Android devices and PC. Built with Python and Tkinter, featuring a beautiful **Chill Dark Theme** and easy-to-use web interface.
 
 ![Python](https://img.shields.io/badge/Python-3.6+-blue.svg)
-![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 
 ## ✨ Features
