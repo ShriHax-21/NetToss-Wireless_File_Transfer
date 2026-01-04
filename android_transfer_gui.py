@@ -12,6 +12,7 @@ import threading
 import webbrowser
 import zipfile
 import io
+import shutil
 from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 import socketserver
@@ -28,15 +29,98 @@ try:
 except ImportError:
     HAS_QRCODE = False
 
-# Configuration
-UPLOAD_DIR = "uploads"
-DOWNLOAD_DIR = "downloads"
+# Configuration - Use current working directory as the share folder
+# Files in this directory will be available for download to phone
+# Uploads from phone go to 'uploads' folder next to the script
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))  # Directory where script is located
+DOWNLOAD_DIR = os.getcwd()  # Current directory where script is opened
+UPLOAD_DIR = os.path.join(SCRIPT_DIR, "uploads")  # Uploads go to script's uploads folder
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+def format_file_size(size_bytes):
+    """Convert bytes to human readable format"""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    elif size_bytes < 1024 * 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024 * 1024):.2f} TB"
+
+def get_free_disk_space(path):
+    """Get free disk space for the given path"""
+    try:
+        total, used, free = shutil.disk_usage(path)
+        return free
+    except Exception:
+        return 0
+
+def get_available_ram():
+    """Get available RAM that can be used for uploads"""
+    try:
+        # Try psutil first (most reliable)
+        import psutil
+        mem = psutil.virtual_memory()
+        return mem.available
+    except ImportError:
+        pass
+    
+    # Fallback for Linux - read /proc/meminfo
+    if sys.platform.startswith('linux'):
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if line.startswith('MemAvailable:'):
+                        # Value is in kB, convert to bytes
+                        return int(line.split()[1]) * 1024
+        except Exception:
+            pass
+    
+    # Fallback for Windows without psutil
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            c_ulonglong = ctypes.c_ulonglong
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ('dwLength', ctypes.c_ulong),
+                    ('dwMemoryLoad', ctypes.c_ulong),
+                    ('ullTotalPhys', c_ulonglong),
+                    ('ullAvailPhys', c_ulonglong),
+                    ('ullTotalPageFile', c_ulonglong),
+                    ('ullAvailPageFile', c_ulonglong),
+                    ('ullTotalVirtual', c_ulonglong),
+                    ('ullAvailVirtual', c_ulonglong),
+                    ('ullAvailExtendedVirtual', c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(stat)
+            kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            return stat.ullAvailPhys
+        except Exception:
+            pass
+    
+    # Final fallback - return 0 (unknown)
+    return 0
 DEFAULT_PORT_HOTSPOT = 1234
 DEFAULT_PORT_INTERNET = 1234
 
-# Create directories
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+# Global max upload size (will be set based on user's RAM input)
+# Default to 4GB, will be updated when user provides RAM info
+MAX_UPLOAD_SIZE = 4 * 1024 * 1024 * 1024  # 4GB default
+USER_RAM_GB = 4  # Default RAM in GB
+
+def set_max_upload_size(ram_gb):
+    """Set max upload size based on user's RAM (uses 80% of specified RAM)"""
+    global MAX_UPLOAD_SIZE, USER_RAM_GB
+    USER_RAM_GB = ram_gb
+    # Use 80% of user's RAM as max upload size
+    MAX_UPLOAD_SIZE = int(ram_gb * 0.8 * 1024 * 1024 * 1024)
+    return MAX_UPLOAD_SIZE
 
 
 # Chill Dark Theme Colors - Relaxing & Professional
@@ -151,7 +235,7 @@ class HotspotTransferHandler(SimpleHTTPRequestHandler):
             self.send_error(404, "File Upload Error")
 
     def upload_form(self):
-        html = r'''<!DOCTYPE html>
+        html = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -513,6 +597,7 @@ class HotspotTransferHandler(SimpleHTTPRequestHandler):
             showStatus('Uploaded ' + files.length + ' file(s)!', 'success');
             fileInput.value = '';
             setTimeout(() => { uploadProgress.style.display = 'none'; progressBar.style.width = '0%'; }, 2000);
+            refreshFiles();
         }
         
         function showStatus(msg, type) {
@@ -523,13 +608,13 @@ class HotspotTransferHandler(SimpleHTTPRequestHandler):
         }
         
         function updateBreadcrumb() {
-            let html = '<a href="#" onclick="navigateTo(\'\'); return false;">🏠 Home</a>';
+            let html = '<a href="#" onclick="navigateTo(\\x27\\x27); return false;">🏠 Home</a>';
             if (currentPath) {
                 const parts = currentPath.split('/');
                 let p = '';
                 parts.forEach((part, i) => {
                     p += (i > 0 ? '/' : '') + part;
-                    html += ' <span>/</span> <a href="#" onclick="navigateTo(\'' + p + '\'); return false;">' + part + '</a>';
+                    html += ' <span>/</span> <a href="#" onclick="navigateTo(\\x27' + p + '\\x27); return false;">' + part + '</a>';
                 });
             }
             breadcrumb.innerHTML = html;
@@ -586,7 +671,6 @@ class HotspotTransferHandler(SimpleHTTPRequestHandler):
         function downloadSelected() {
             if (selectedItems.size === 0) return;
             const selectedPaths = Array.from(selectedItems);
-            // If only one item selected and it's a file, download directly
             if (selectedPaths.length === 1) {
                 const item = currentItems.find(i => i.path === selectedPaths[0]);
                 if (item && item.type === 'file') {
@@ -594,7 +678,6 @@ class HotspotTransferHandler(SimpleHTTPRequestHandler):
                     return;
                 }
             }
-            // Multiple items or folders - use ZIP
             const items = selectedPaths.map(i => encodeURIComponent(i)).join(',');
             window.location.href = '/download-selected?items=' + items;
         }
@@ -610,9 +693,9 @@ class HotspotTransferHandler(SimpleHTTPRequestHandler):
                 const typeLabel = isFolder ? '<span class="file-type folder">Folder</span>' : '<span class="file-type">File</span>';
                 const dlUrl = isFolder ? '/download-folder/' + encodeURIComponent(item.path) : '/download/' + encodeURIComponent(item.path);
                 const sel = selectedItems.has(item.path);
-                const clickAction = isFolder ? 'navigateTo(\'' + item.path + '\')' : 'window.location.href=\'' + dlUrl + '\'';
+                const clickAction = isFolder ? "navigateTo('" + item.path + "')" : "window.location.href='" + dlUrl + "'";
                 return '<li class="file-item' + (sel ? ' selected' : '') + '">' +
-                    '<input type="checkbox" class="file-checkbox" ' + (sel ? 'checked' : '') + ' onclick="toggleItem(\'' + item.path + '\')">' +
+                    '<input type="checkbox" class="file-checkbox" ' + (sel ? 'checked' : '') + ' onclick="toggleItem(\\x27' + item.path + '\\x27)">' +
                     '<span class="file-icon">' + icon + '</span>' +
                     '<div class="file-info">' +
                         '<div class="file-name" onclick="' + clickAction + '">' + item.name + '</div>' +
@@ -653,7 +736,7 @@ class HotspotTransferHandler(SimpleHTTPRequestHandler):
         refreshFiles();
     </script>
 </body>
-</html>'''
+</html>"""
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -665,8 +748,9 @@ class HotspotTransferHandler(SimpleHTTPRequestHandler):
     def handle_file_upload(self):
         try:
             content_length = int(self.headers.get("Content-Length", 0))
-            if content_length > 500_000_000:
-                self.send_error(413, "File too large (max 500MB)")
+            max_size_gb = MAX_UPLOAD_SIZE / (1024 * 1024 * 1024)
+            if content_length > MAX_UPLOAD_SIZE:
+                self.send_error(413, f"File too large (max {max_size_gb:.1f}GB based on RAM)")
                 return
 
             boundary = self.headers.get('Content-Type').split('boundary=')[-1]
@@ -724,6 +808,10 @@ class HotspotTransferHandler(SimpleHTTPRequestHandler):
             
             items = []
             for filename in os.listdir(target_dir):
+                # Skip hidden files and folders (starting with .)
+                if filename.startswith('.'):
+                    continue
+                    
                 filepath = os.path.join(target_dir, filename)
                 relative_path = os.path.join(subpath, filename) if subpath else filename
                 
@@ -766,7 +854,12 @@ class HotspotTransferHandler(SimpleHTTPRequestHandler):
         """Calculate total size of a folder"""
         total_size = 0
         for dirpath, dirnames, filenames in os.walk(folder_path):
+            # Skip hidden directories
+            dirnames[:] = [d for d in dirnames if not d.startswith('.')]
             for filename in filenames:
+                # Skip hidden files
+                if filename.startswith('.'):
+                    continue
                 filepath = os.path.join(dirpath, filename)
                 try:
                     total_size += os.path.getsize(filepath)
@@ -788,7 +881,12 @@ class HotspotTransferHandler(SimpleHTTPRequestHandler):
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
                 for root, dirs, files in os.walk(full_path):
+                    # Skip hidden directories
+                    dirs[:] = [d for d in dirs if not d.startswith('.')]
                     for file in files:
+                        # Skip hidden files
+                        if file.startswith('.'):
+                            continue
                         file_path = os.path.join(root, file)
                         arcname = os.path.relpath(file_path, full_path)
                         zip_file.write(file_path, arcname)
@@ -839,7 +937,12 @@ class HotspotTransferHandler(SimpleHTTPRequestHandler):
                         zip_file.write(item_path, item_path.name)
                     elif item_path.is_dir():
                         for root, dirs, files in os.walk(item_path):
+                            # Skip hidden directories
+                            dirs[:] = [d for d in dirs if not d.startswith('.')]
                             for file in files:
+                                # Skip hidden files
+                                if file.startswith('.'):
+                                    continue
                                 file_path = os.path.join(root, file)
                                 arcname = os.path.join(item_path.name, os.path.relpath(file_path, item_path))
                                 zip_file.write(file_path, arcname)
@@ -897,7 +1000,7 @@ class InternetTransferHandler(HotspotTransferHandler):
     """Handler for Internet/WiFi mode transfers - inherits from Hotspot with different styling"""
     
     def upload_form(self):
-        html = r'''<!DOCTYPE html>
+        html = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -1259,6 +1362,7 @@ class InternetTransferHandler(HotspotTransferHandler):
             showStatus('Uploaded ' + files.length + ' file(s)!', 'success');
             fileInput.value = '';
             setTimeout(() => { uploadProgress.style.display = 'none'; progressBar.style.width = '0%'; }, 2000);
+            refreshFiles();
         }
         
         function showStatus(msg, type) {
@@ -1269,13 +1373,13 @@ class InternetTransferHandler(HotspotTransferHandler):
         }
         
         function updateBreadcrumb() {
-            let html = '<a href="#" onclick="navigateTo(\'\'); return false;">🏠 Home</a>';
+            let html = '<a href="#" onclick="navigateTo(\\x27\\x27); return false;">🏠 Home</a>';
             if (currentPath) {
                 const parts = currentPath.split('/');
                 let p = '';
                 parts.forEach((part, i) => {
                     p += (i > 0 ? '/' : '') + part;
-                    html += ' <span>/</span> <a href="#" onclick="navigateTo(\'' + p + '\'); return false;">' + part + '</a>';
+                    html += ' <span>/</span> <a href="#" onclick="navigateTo(\\x27' + p + '\\x27); return false;">' + part + '</a>';
                 });
             }
             breadcrumb.innerHTML = html;
@@ -1332,7 +1436,6 @@ class InternetTransferHandler(HotspotTransferHandler):
         function downloadSelected() {
             if (selectedItems.size === 0) return;
             const selectedPaths = Array.from(selectedItems);
-            // If only one item selected and it's a file, download directly
             if (selectedPaths.length === 1) {
                 const item = currentItems.find(i => i.path === selectedPaths[0]);
                 if (item && item.type === 'file') {
@@ -1340,7 +1443,6 @@ class InternetTransferHandler(HotspotTransferHandler):
                     return;
                 }
             }
-            // Multiple items or folders - use ZIP
             const items = selectedPaths.map(i => encodeURIComponent(i)).join(',');
             window.location.href = '/download-selected?items=' + items;
         }
@@ -1356,9 +1458,9 @@ class InternetTransferHandler(HotspotTransferHandler):
                 const typeLabel = isFolder ? '<span class="file-type folder">Folder</span>' : '<span class="file-type">File</span>';
                 const dlUrl = isFolder ? '/download-folder/' + encodeURIComponent(item.path) : '/download/' + encodeURIComponent(item.path);
                 const sel = selectedItems.has(item.path);
-                const clickAction = isFolder ? 'navigateTo(\'' + item.path + '\')' : 'window.location.href=\'' + dlUrl + '\'';
+                const clickAction = isFolder ? "navigateTo('" + item.path + "')" : "window.location.href='" + dlUrl + "'";
                 return '<li class="file-item' + (sel ? ' selected' : '') + '">' +
-                    '<input type="checkbox" class="file-checkbox" ' + (sel ? 'checked' : '') + ' onclick="toggleItem(\'' + item.path + '\')">' +
+                    '<input type="checkbox" class="file-checkbox" ' + (sel ? 'checked' : '') + ' onclick="toggleItem(\\x27' + item.path + '\\x27)">' +
                     '<span class="file-icon">' + icon + '</span>' +
                     '<div class="file-info">' +
                         '<div class="file-name" onclick="' + clickAction + '">' + item.name + '</div>' +
@@ -1399,7 +1501,7 @@ class InternetTransferHandler(HotspotTransferHandler):
         refreshFiles();
     </script>
 </body>
-</html>'''
+</html>"""
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -1618,6 +1720,70 @@ class AndroidTransferGUI:
         btn_container = ttk.Frame(control_frame)
         btn_container.pack(expand=True)
         
+        # Storage info box - shows max upload size
+        storage_box = tk.Frame(btn_container, bg=ThemeColors.BG_CARD, 
+                               highlightbackground=ThemeColors.BORDER, highlightthickness=2,
+                               padx=12, pady=8)
+        storage_box.pack(side=tk.LEFT, padx=(0, 10))
+        
+        storage_title = tk.Label(storage_box, text="💾 Max Upload", 
+                                  font=("Helvetica", 10, "bold"),
+                                  bg=ThemeColors.BG_CARD, fg=ThemeColors.TEXT_PRIMARY)
+        storage_title.pack()
+        
+        self.max_size_value = tk.Label(storage_box, text="Calculating...", 
+                                        font=("Helvetica", 11, "bold"),
+                                        bg=ThemeColors.BG_CARD, fg=ThemeColors.ACCENT_PRIMARY)
+        self.max_size_value.pack()
+        
+        # RAM input box - separate box for RAM configuration
+        ram_box = tk.Frame(btn_container, bg=ThemeColors.BG_CARD, 
+                           highlightbackground=ThemeColors.BORDER, highlightthickness=2,
+                           padx=12, pady=8)
+        ram_box.pack(side=tk.LEFT, padx=(0, 15))
+        
+        ram_title = tk.Label(ram_box, text="🧠 RAM", 
+                              font=("Helvetica", 10, "bold"),
+                              bg=ThemeColors.BG_CARD, fg=ThemeColors.TEXT_PRIMARY)
+        ram_title.pack()
+        
+        # RAM input row
+        ram_row = tk.Frame(ram_box, bg=ThemeColors.BG_CARD)
+        ram_row.pack(pady=(5, 0))
+        
+        self.ram_var = tk.StringVar(value="8")
+        self.ram_entry = tk.Entry(ram_row, width=4,
+                                   textvariable=self.ram_var,
+                                   font=("Helvetica", 10),
+                                   bg=ThemeColors.BG_SECONDARY,
+                                   fg=ThemeColors.TEXT_PRIMARY,
+                                   insertbackground=ThemeColors.TEXT_PRIMARY,
+                                   highlightbackground=ThemeColors.BORDER,
+                                   highlightthickness=1,
+                                   relief="flat")
+        self.ram_entry.pack(side=tk.LEFT)
+        
+        ram_unit = tk.Label(ram_row, text="GB", 
+                             font=("Helvetica", 9),
+                             bg=ThemeColors.BG_CARD, fg=ThemeColors.TEXT_SECONDARY)
+        ram_unit.pack(side=tk.LEFT, padx=(3, 5))
+        
+        # OK button
+        self.ram_ok_btn = tk.Button(ram_row, text="OK",
+                                     font=("Helvetica", 9, "bold"),
+                                     bg=ThemeColors.ACCENT_PRIMARY,
+                                     fg=ThemeColors.BG_DARK,
+                                     activebackground=ThemeColors.ACCENT_SECONDARY,
+                                     activeforeground=ThemeColors.BG_DARK,
+                                     relief="flat",
+                                     padx=8, pady=2,
+                                     cursor="hand2",
+                                     command=self.on_ram_change)
+        self.ram_ok_btn.pack(side=tk.LEFT)
+        
+        # Update max file size initially
+        self.update_max_file_size()
+        
         self.start_btn = ttk.Button(
             btn_container,
             text="▶  Start Server",
@@ -1635,7 +1801,17 @@ class AndroidTransferGUI:
             style="Secondary.TButton",
             width=20
         )
-        self.open_browser_btn.pack(side=tk.LEFT)
+        self.open_browser_btn.pack(side=tk.LEFT, padx=(0, 15))
+        
+        # Force stop button (hidden initially)
+        self.force_stop_btn = ttk.Button(
+            btn_container,
+            text="⚠  Force Stop",
+            command=self.force_stop_server,
+            style="Danger.TButton",
+            width=15
+        )
+        # Don't pack initially - will show when server is running
         
         # Status and Log Side by Side Frame
         status_log_frame = ttk.Frame(main_frame)
@@ -1716,12 +1892,20 @@ class AndroidTransferGUI:
         ttk.Label(upload_row, text="📥 Uploads:", font=("Helvetica", 9)).pack(side=tk.LEFT)
         ttk.Button(upload_row, text="Open", command=lambda: self.open_folder(UPLOAD_DIR), width=6).pack(side=tk.RIGHT)
         
+        # Upload path display
+        upload_path_label = ttk.Label(status_frame, text=UPLOAD_DIR, font=("Consolas", 8), foreground=ThemeColors.TEXT_MUTED)
+        upload_path_label.pack(anchor=tk.W, padx=(20, 0))
+        
         # Download folder
         download_row = ttk.Frame(status_frame)
-        download_row.pack(fill=tk.X, pady=2)
+        download_row.pack(fill=tk.X, pady=(5, 2))
         
-        ttk.Label(download_row, text="📁 Downloads:", font=("Helvetica", 9)).pack(side=tk.LEFT)
+        ttk.Label(download_row, text="📁 Sharing:", font=("Helvetica", 9)).pack(side=tk.LEFT)
         ttk.Button(download_row, text="Open", command=lambda: self.open_folder(DOWNLOAD_DIR), width=6).pack(side=tk.RIGHT)
+        
+        # Download/Share path display
+        download_path_label = ttk.Label(status_frame, text=DOWNLOAD_DIR, font=("Consolas", 8), foreground=ThemeColors.TEXT_MUTED)
+        download_path_label.pack(anchor=tk.W, padx=(20, 0))
         
         # Right side - Activity Log
         log_frame = ttk.LabelFrame(status_log_frame, text="Activity Log", padding="10")
@@ -1843,6 +2027,7 @@ class AndroidTransferGUI:
             # Update UI with modern styling
             self.start_btn.config(text="⏹  Stop Server", style="Danger.TButton")
             self.open_browser_btn.config(state=tk.NORMAL)
+            self.force_stop_btn.pack(side=tk.LEFT)  # Show force stop button
             self.port_entry.config(state=tk.DISABLED)
             
             mode_text = "📶 Hotspot" if mode == "hotspot" else "🌐 WiFi"
@@ -1883,6 +2068,7 @@ class AndroidTransferGUI:
         # Update UI with modern styling
         self.start_btn.config(text="▶  Start Server", style="Success.TButton")
         self.open_browser_btn.config(state=tk.DISABLED)
+        self.force_stop_btn.pack_forget()  # Hide force stop button
         self.port_entry.config(state=tk.NORMAL)
         self.status_label.config(text="⚫  Server stopped")
         self.url_var.set("")
@@ -1892,9 +2078,86 @@ class AndroidTransferGUI:
         
         self.log("Server stopped")
     
+    def force_stop_server(self):
+        """Force stop the HTTP server - more aggressive termination"""
+        self.log("⚠ Force stopping server...")
+        
+        if self.server:
+            server_to_close = self.server
+            self.server = None
+            
+            # Force close the socket immediately
+            try:
+                server_to_close.socket.close()
+            except Exception:
+                pass
+            
+            # Try to shutdown (non-blocking)
+            try:
+                # Use a thread to prevent blocking if shutdown hangs
+                def force_shutdown():
+                    try:
+                        server_to_close.shutdown()
+                    except Exception:
+                        pass
+                
+                shutdown_thread = threading.Thread(target=force_shutdown, daemon=True)
+                shutdown_thread.start()
+                shutdown_thread.join(timeout=1.0)  # Wait max 1 second
+            except Exception:
+                pass
+            
+            # Force close again
+            try:
+                server_to_close.server_close()
+            except Exception:
+                pass
+        
+        # Kill the server thread if still running
+        if self.server_thread and self.server_thread.is_alive():
+            self.log("⚠ Server thread still active, it will terminate shortly")
+        
+        self.server_thread = None
+        self.is_running = False
+        
+        # Update UI
+        self.start_btn.config(text="▶  Start Server", style="Success.TButton")
+        self.open_browser_btn.config(state=tk.DISABLED)
+        self.force_stop_btn.pack_forget()
+        self.port_entry.config(state=tk.NORMAL)
+        self.status_label.config(text="⚫  Server force stopped")
+        self.url_var.set("")
+        self.copy_btn.pack_forget()
+        self.qr_label.config(image="", text="Start server\nto generate", bg=ThemeColors.BG_SECONDARY, fg=ThemeColors.TEXT_MUTED)
+        reset_connection_count()
+        
+        self.log("✓ Server force stopped")
+    
     def update_connection_count(self, count):
         """Update the connection counter display"""
         self.connection_label.config(text=f"📊 Connections: {count}")
+    
+    def on_ram_change(self):
+        """Handle RAM value change from spinbox"""
+        try:
+            ram_value = float(self.ram_var.get())
+            if 1 <= ram_value <= 128:
+                set_max_upload_size(ram_value)
+                self.update_max_file_size()
+        except ValueError:
+            pass  # Invalid input, ignore
+    
+    def update_max_file_size(self):
+        """Update the max file size display based on user-specified RAM"""
+        try:
+            # Use the global MAX_UPLOAD_SIZE set by user's RAM input
+            if MAX_UPLOAD_SIZE > 0:
+                formatted_size = format_file_size(MAX_UPLOAD_SIZE)
+                self.max_size_value.config(text=f"{formatted_size}")
+            else:
+                self.max_size_value.config(text="Unknown")
+        except Exception:
+            self.max_size_value.config(text="Unknown")
     
     def generate_qr(self, url):
         """Generate and display QR code with dark theme"""
@@ -1921,8 +2184,8 @@ class AndroidTransferGUI:
             self.qr_image = ImageTk.PhotoImage(img)
             self.qr_label.config(image=self.qr_image, text="", bg=ThemeColors.BG_SECONDARY)
             
-            # Also save QR code
-            qr_path = "connection_qr.png"
+            # Also save QR code to script's directory
+            qr_path = os.path.join(SCRIPT_DIR, "connection_qr.png")
             img.save(qr_path)
             
         except Exception as e:
@@ -2245,6 +2508,9 @@ def main():
             print("QR code library installed. Please restart the application.")
         except:
             print("Warning: QR code generation will be unavailable")
+    
+    # Set default RAM (8GB) - user can change in GUI
+    set_max_upload_size(8)
     
     root = tk.Tk()
     
